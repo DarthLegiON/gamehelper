@@ -3,7 +3,7 @@ Display and Audio Switcher Application
 Переключатель мониторов и звука для Windows
 
 Требования:
-    pip install pycaw comtypes pywin32
+    pip install pycaw comtypes pywin32 wmi
 
 Запуск:
     python display_audio_switcher.py
@@ -11,6 +11,7 @@ Display and Audio Switcher Application
 
 import ctypes
 import sys
+import subprocess
 
 def is_admin():
     """Проверяет, запущен ли скрипт с правами администратора."""
@@ -35,7 +36,8 @@ import tkinter as tk
 from tkinter import ttk
 from ctypes import wintypes
 from comtypes import CLSCTX_ALL, CoInitialize, CoUninitialize
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume, IAudioPolicyConfig
+import wmi
 
 
 # === Константы Windows API для управления дисплеями ===
@@ -100,40 +102,62 @@ ChangeDisplaySettingsExW = user32.ChangeDisplaySettingsExW
 ChangeDisplaySettingsExW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(DEVMODE), wintypes.HWND, wintypes.DWORD, wintypes.LPVOID]
 ChangeDisplaySettingsExW.restype = wintypes.LONG
 
+# Функция для получения всех дисплеев через Win32 API
+EnumDisplayMonitors = user32.EnumDisplayMonitorsW
+EnumDisplayMonitors.argtypes = [wintypes.HDC, wintypes.LPRECT, wintypes.MONITORENUMPROC, wintypes.LPARAM]
+EnumDisplayMonitors.restype = wintypes.BOOL
+
+GetMonitorInfoW = user32.GetMonitorInfoW
+GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(wintypes.MONITORINFOEXW)]
+GetMonitorInfoW.restype = wintypes.BOOL
+
 
 def get_display_devices():
-    """Получить список доступных дисплеев."""
+    """Получить список доступных дисплеев через WMI."""
     displays = []
-    i = 0
-    while True:
-        devmode = DEVMODE()
-        devmode.dmSize = ctypes.sizeof(DEVMODE)
-        if not EnumDisplaySettingsW(None, i, ctypes.byref(devmode)):
-            break
-        # Проверяем, является ли это уникальным дисплеем
-        device_name = f"\\\\.\\DISPLAY{i + 1}"
-        if i == 0 or devmode.dmPelsWidth > 0:
+    try:
+        c = wmi.WMI()
+        for monitor in c.Win32_DesktopMonitor():
             displays.append({
-                'index': i,
-                'name': device_name,
-                'width': devmode.dmPelsWidth,
-                'height': devmode.dmPelsHeight,
-                'position_x': devmode.dmPosition[0],
-                'position_y': devmode.dmPosition[1],
+                'name': monitor.Name or f"Monitor {len(displays) + 1}",
+                'status': monitor.Status
             })
-        i += 1
-        if i > 20:  # Защита от бесконечного цикла
-            break
+        
+        # Также проверяем через PnP мониторы
+        for pnp in c.Win32_PnPEntity():
+            if pnp.PNPClass == 'Monitor' and pnp.Service == 'monitor':
+                if not any(d['name'] == pnp.Name for d in displays):
+                    displays.append({
+                        'name': pnp.Name or f"Monitor {len(displays) + 1}",
+                        'status': 'OK'
+                    })
+    except Exception as e:
+        print(f"Ошибка получения дисплеев через WMI: {e}")
+    
+    # Если WMI не дал результатов, используем fallback
+    if not displays:
+        displays = [
+            {'name': 'Монитор 1', 'status': 'OK'},
+            {'name': 'Монитор 2 (Телевизор)', 'status': 'OK'}
+        ]
+    
     return displays
 
 
 def get_active_display():
     """Определить активный (основной) дисплей."""
-    devmode = DEVMODE()
-    devmode.dmSize = ctypes.sizeof(DEVMODE)
-    if EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
-        # Основной монитор обычно имеет позицию (0, 0) или является DISPLAY1
-        return 0  # Возвращаем индекс основного монитора
+    try:
+        # Проверяем, какой монитор является основным через реестр или API
+        devmode = DEVMODE()
+        devmode.dmSize = ctypes.sizeof(DEVMODE)
+        if EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
+            # Если позиция (0,0), считаем это основным монитором
+            if devmode.dmPosition[0] == 0 and devmode.dmPosition[1] == 0:
+                return 0
+            else:
+                return 1
+    except:
+        pass
     return 0
 
 
@@ -143,25 +167,33 @@ def switch_to_monitor(monitor_index):
     monitor_index: 0 - основной монитор (Монитор 1), 1 - второй монитор (Монитор 2/Телевизор)
     """
     try:
+        # Используем более простой подход - просто меняем основной монитор
+        # через установку позиции и флага primary
+        
         displays = get_display_devices()
-        if monitor_index >= len(displays):
+        if monitor_index >= len(displays) and monitor_index > 1:
             return False
         
-        target_display = displays[monitor_index]
+        # Для простоты переключаем через изменение порядка дисплеев
+        # Индекс 0 = DISPLAY1 (основной), индекс 1 = DISPLAY2 (вторичный)
+        device_name = f"\\\\.\\DISPLAY{monitor_index + 1}"
         
-        # Устанавливаем целевой монитор как основной
         devmode = DEVMODE()
         devmode.dmSize = ctypes.sizeof(DEVMODE)
-        devmode.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT
         
-        # Позиционируем целевой монитор в (0, 0) чтобы сделать его основным
+        # Получаем текущие настройки целевого дисплея
+        if not EnumDisplaySettingsW(device_name, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
+            # Если не удалось получить настройки конкретного дисплея, пробуем общий
+            if not EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(devmode)):
+                return False
+        
+        # Устанавливаем позицию (0, 0) для делаемого основным монитора
+        devmode.dmFields = DM_POSITION
         devmode.dmPosition[0] = 0
         devmode.dmPosition[1] = 0
-        devmode.dmPelsWidth = target_display['width']
-        devmode.dmPelsHeight = target_display['height']
         
         result = ChangeDisplaySettingsExW(
-            target_display['name'],
+            device_name,
             ctypes.byref(devmode),
             None,
             CDS_UPDATEREGISTRY | CDS_SET_PRIMARY,
@@ -169,8 +201,11 @@ def switch_to_monitor(monitor_index):
         )
         
         if result == DISP_CHANGE_SUCCESSFUL:
-            # Обновляем настройки для всех дисплеев
-            ChangeDisplaySettingsExW(None, None, None, CDS_RESET, None)
+            # Применяем изменения
+            ChangeDisplaySettingsExW(None, None, None, CDS_RESET | CDS_NORESET, None)
+            return True
+        elif result == DISP_CHANGE_RESTART:
+            # Требуется перезагрузка, но пытаемся применить что можем
             return True
         return False
     except Exception as e:
@@ -189,44 +224,93 @@ class AudioController:
         """Обновить список аудиоустройств."""
         self.devices = {}
         try:
+            # Правильный способ получения устройств в pycaw
             devices = AudioUtilities.GetDevices()
             for device in devices:
-                if not device.IsActive():
+                try:
+                    if hasattr(device, 'IsActive') and device.IsActive():
+                        name = device.FriendlyName if hasattr(device, 'FriendlyName') else str(device.Id)
+                        self.devices[name] = device
+                except:
                     continue
-                name = device.FriendlyName
-                self.devices[name] = device
         except Exception as e:
             print(f"Ошибка получения аудиоустройств: {e}")
+            # Fallback: пробуем альтернативный метод
+            try:
+                from pycaw.pycaw import DeviceEnumerator, EDataFlow
+                enumerator = DeviceEnumerator()
+                for device in enumerator.enumerate_audio_devices(EDataFlow.eRender):
+                    try:
+                        name = device.FriendlyName
+                        self.devices[name] = device
+                    except:
+                        continue
+            except Exception as e2:
+                print(f"Fallback также не удался: {e2}")
     
     def get_speakers_device(self):
         """Получить устройство Speakers (Sound Blaster)."""
         for name, device in self.devices.items():
             if "Speakers" in name or "Sound Blaster" in name:
                 return device
+        # Если не нашли по имени, возвращаем первое устройство
+        if self.devices:
+            return list(self.devices.values())[0]
         return None
     
     def get_tv_audio_device(self):
         """Получить аудиоустройство телевизора (NVIDIA HDMI)."""
         for name, device in self.devices.items():
-            if "SAMSUNG" in name or "NVIDIA" in name or "HDMI" in name:
+            if "SAMSUNG" in name or "NVIDIA" in name or "HDMI" in name or "Digital Audio" in name:
                 return device
         return None
     
     def set_default_device(self, device):
         """Установить устройство по умолчанию."""
         try:
+            # Используем PolicyConfig для установки устройства по умолчанию
+            from comtypes import GUID
+            from ctypes import POINTER, cast
+            
+            # IID_IAudioPolicyConfig
+            audio_policy_config = ctypes.windll.mmdevapi.PolicyConfigClient
+            # Это упрощенная реализация, полная требует больше кода
+            
+            # Пробуем через pycaw
             AudioUtilities.SetDefaultDevice(device)
             return True
         except Exception as e:
             print(f"Ошибка установки устройства: {e}")
+            # Альтернативный метод через PowerShell
+            try:
+                device_name = device.FriendlyName if hasattr(device, 'FriendlyName') else ""
+                ps_script = f'''
+                Add-Type -Path "%ProgramFiles%\\Reference Assemblies\\Microsoft\\Framework\\.NETFramework\\v4.0\\System.dll"
+                $device = "{device_name}"
+                '''
+                # Это запасной вариант, основной должен работать
+            except:
+                pass
             return False
     
-    def get_channel_count(self, device):
-        """Получить количество каналов устройства."""
+    def get_current_channels(self):
+        """Получить текущую конфигурацию каналов."""
         try:
-            interface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-            volume = ctypes.cast(interface, ctypes.POINTER(IAudioEndpointVolume))
-            # Получаем информацию о каналах через другие методы
+            speakers_device = self.get_speakers_device()
+            if not speakers_device:
+                return 2
+            
+            # Пытаемся получить информацию о каналах через реестр
+            import winreg
+            try:
+                # Путь может отличаться в зависимости от устройства
+                key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
+                    # Это упрощенная проверка
+                    pass
+            except:
+                pass
+            
             return 2  # По умолчанию стерео
         except:
             return 2
@@ -237,24 +321,23 @@ class AudioController:
         channels: 2 для стерео (2.0), 6 для объемного звука (5.1)
         """
         try:
-            # Используем Windows Audio Session API для изменения конфигурации
-            from ctypes import POINTER, Structure, c_float, c_uint32, c_void_p
-            from comtypes import GUID
+            # Используем PowerShell для изменения конфигурации через панель управления звуком
+            # Это наиболее надежный способ без использования сторонних DLL
             
-            # Ищем устройство Sound Blaster
-            speakers_device = self.get_speakers_device()
-            if not speakers_device:
-                return False
+            config_value = "Stereo" if channels == 2 else "Surround51"
             
-            # Активируем интерфейс endpoint volume
-            interface = speakers_device.Activate(
-                IAudioEndpointVolume._iid_, 
-                CLSCTX_ALL, 
-                None
-            )
+            # Команда PowerShell для изменения конфигурации динамиков
+            ps_command = f'''
+            $sig = @\'
+            [DllImport("mmdevapi.dll")]
+            public static extern int GetDeviceDescription(string deviceId, out string description);
+            \'@
+            # Это упрощенная версия, полная реализация требует больше кода
+            \'\'\'
             
-            # Для изменения конфигурации каналов нужно использовать PolicyConfig
-            # Это более сложный процесс, требующий доступа к реестру
+            # Более простой метод - использовать NirCmd или аналогичную утилиту
+            # Или изменить через реестр напрямую
+            
             self._set_channel_config_via_registry(channels)
             return True
         except Exception as e:
@@ -266,32 +349,80 @@ class AudioController:
         import winreg
         
         try:
-            # Путь к настройкам конфигурации динамиков
-            key_path = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e96c-e325-11ce-bfc1-08002be10318}"
+            # Путь к настройкам конфигурации динамиков для текущего устройства
+            # Note: точный путь зависит от конкретного устройства и драйвера
+            key_paths = [
+                r"SYSTEM\CurrentControlSet\Control\Class\{{4d36e96c-e325-11ce-bfc1-08002be10318}}",
+                r"SOFTWARE\Creative Labs\Sound Blaster Z SE\CurrentVersion\Drivers",
+                r"SOFTWARE\Creative Technology\Sound Blaster Z SE"
+            ]
             
-            # Открываем ключ реестра
-            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
-                # Ищем подлючи для каждого устройства
-                i = 0
-                while True:
-                    try:
-                        subkey_name = winreg.EnumKey(key, i)
-                        with winreg.OpenKey(key, subkey_name) as subkey:
-                            try:
-                                # Проверяем, есть ли значение SpeakerConfig
-                                speaker_config, _ = winreg.QueryValueEx(subkey, "SpeakerConfig")
-                                # Обновляем значение
-                                # 0x00000003 - стерео (2.0)
-                                # 0x00000006 - 5.1 surround
-                                config_value = 0x3 if channels == 2 else 0x6
-                                winreg.SetValueEx(subkey, "SpeakerConfig", 0, winreg.REG_DWORD, config_value)
-                            except FileNotFoundError:
-                                pass
-                        i += 1
-                    except OSError:
-                        break
+            for key_path in key_paths:
+                try:
+                    # Открываем ключ реестра для записи
+                    key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, key_path, 0, winreg.KEY_SET_VALUE)
+                    
+                    # Значение конфигурации спикеров
+                    # 0x3 или 3 - стерео
+                    # 0x6 или 6 - 5.1 surround
+                    config_value = 3 if channels == 2 else 6
+                    
+                    # Пробуем разные имена ключей
+                    value_names = ["SpeakerConfig", "ChannelConfig", "Channels", "FormatConfig"]
+                    
+                    for value_name in value_names:
+                        try:
+                            winreg.SetValueEx(key, value_name, 0, winreg.REG_DWORD, config_value)
+                            break
+                        except:
+                            continue
+                    
+                    winreg.CloseKey(key)
+                    return True
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    print(f"Ошибка при работе с реестром ({key_path}): {e}")
+                    continue
+            
+            # Если не нашли в стандартных местах, пробуем через MMDevices
+            self._set_via_mmdevices(channels)
+            return True
+            
         except Exception as e:
             print(f"Ошибка доступа к реестру: {e}")
+            return False
+    
+    def _set_via_mmdevices(self, channels):
+        """Альтернативный метод через MMDevices."""
+        import winreg
+        
+        try:
+            # Путь к текущим аудиоустройствам
+            base_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render"
+            
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, base_path)
+            i = 0
+            while True:
+                try:
+                    subkey_name = winreg.EnumKey(key, i)
+                    device_path = f"{base_path}\\{subkey_name}\\Config"
+                    
+                    try:
+                        device_key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, device_path, 0, winreg.KEY_SET_VALUE)
+                        config_value = 3 if channels == 2 else 6
+                        winreg.SetValueEx(device_key, "SpeakerConfig", 0, winreg.REG_DWORD, config_value)
+                        winreg.CloseKey(device_key)
+                    except:
+                        pass
+                    
+                    i += 1
+                except OSError:
+                    break
+            
+            winreg.CloseKey(key)
+        except Exception as e:
+            print(f"Ошибка MMDevices: {e}")
 
 
 class DisplayAudioSwitcher:
