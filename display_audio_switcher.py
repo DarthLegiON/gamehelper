@@ -321,23 +321,7 @@ class AudioController:
         channels: 2 для стерео (2.0), 6 для объемного звука (5.1)
         """
         try:
-            # Используем PowerShell для изменения конфигурации через панель управления звуком
-            # Это наиболее надежный способ без использования сторонних DLL
-            
-            config_value = "Stereo" if channels == 2 else "Surround51"
-            
-            # Команда PowerShell для изменения конфигурации динамиков
-            ps_command = f'''
-            $sig = @\'
-            [DllImport("mmdevapi.dll")]
-            public static extern int GetDeviceDescription(string deviceId, out string description);
-            \'@
-            # Это упрощенная версия, полная реализация требует больше кода
-            \'\'\'
-            
-            # Более простой метод - использовать NirCmd или аналогичную утилиту
-            # Или изменить через реестр напрямую
-            
+            # Изменяем конфигурацию через реестр Windows
             self._set_channel_config_via_registry(channels)
             return True
         except Exception as e:
